@@ -1,0 +1,13 @@
+idf_component_register(
+  SRCS
+    "main.cpp"
+    "arduino_sensors.cpp"
+    "ml/autoencoder.cpp"
+    "data/sensors.cpp"
+    "app/pipeline.cpp"
+  INCLUDE_DIRS
+    "."
+    "../include"
+  REQUIRES
+    framework-arduinoespressif32
+)

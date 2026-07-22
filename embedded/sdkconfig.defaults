@@ -1,0 +1,36 @@
+# ESP-IDF(메인) + Arduino(센서 라이브러리용 컴포넌트) 하이브리드 기본값
+
+# Arduino 자동 app_main()/setup()/loop() 실행은 끄고, 프로젝트에서 app_main()을 구현
+CONFIG_AUTOSTART_ARDUINO=n
+
+# Arduino variant(핀맵). framework-arduinoespressif32/variants 폴더명과 일치해야 함
+CONFIG_ARDUINO_VARIANT="lolin_s3_pro"
+
+# Arduino delay()/millis() 등 호환을 위해 FreeRTOS tick은 1000Hz 권장
+CONFIG_FREERTOS_HZ=1000
+
+# Board flash size와 IDF 설정이 다르면 경고가 나올 수 있어 16MB로 고정
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# IDF(부트로더/OTA)도 Arduino와 동일한 16MB OTA 파티션 테이블을 사용
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb_ota.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_16mb_ota.csv"
+
+# PSRAM(ESP32-S3 Octal PSRAM) + malloc/new를 PSRAM heap으로 사용
+CONFIG_ESP32S3_SPIRAM_SUPPORT=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_CLK_IO=30
+CONFIG_SPIRAM_CS_IO=26
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=0
+
+# ESP-IDF 로그 컬러(ANSI escape)가 모니터에 그대로 찍히는 경우가 있어 비활성화
+# CONFIG_LOG_COLORS is not set

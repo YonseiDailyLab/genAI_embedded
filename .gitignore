@@ -1,0 +1,94 @@
+# ─────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ─────────────────────────────────────────────────────────────
+# Separate/experimental repo — not part of this project
+# (private repo git@github.com:yjkwon7/generativeAI.git, nothing here imports it)
+# ─────────────────────────────────────────────────────────────
+vision_ex/
+
+# ─────────────────────────────────────────────────────────────
+# Secrets / environment
+# ─────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+
+# ─────────────────────────────────────────────────────────────
+# Editors / OS
+# ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+AGENTS.md
+
+# ─────────────────────────────────────────────────────────────
+# Embedded (PlatformIO / ESP-IDF)
+# ─────────────────────────────────────────────────────────────
+.pio/
+embedded/.pio/
+sdkconfig
+sdkconfig.old
+build/
+
+# ─────────────────────────────────────────────────────────────
+# Logs / runtime state
+# ─────────────────────────────────────────────────────────────
+*.log
+*.pid
+
+# ─────────────────────────────────────────────────────────────
+# Large datasets (not versioned — distribute separately)
+# ─────────────────────────────────────────────────────────────
+data/
+data_data.zip
+*.jsonl
+*.csv
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# ─────────────────────────────────────────────────────────────
+# Model weights / checkpoints / exported artifacts
+# ─────────────────────────────────────────────────────────────
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.h5
+*.pb
+*.onnx
+*.tflite
+*.engine
+*.gguf
+*.bin
+iot_server/vision/checkpoints/
