@@ -5,9 +5,9 @@
 namespace tinyae {
 namespace ml {
 
-// Autoencoder spec (60-16-4-16-60)
-// 10 sensor features × 6 statistics (mean, std, min, max, slope, curvature) = 60
-constexpr uint32_t kAutoencoderInputDim = 60;
+// Autoencoder spec (90-16-4-16-90)
+// 15 sensor features × 6 statistics (mean, std, min, max, slope, curvature) = 90
+constexpr uint32_t kAutoencoderInputDim = 90;
 
 enum class AutoencoderOptimizer : uint8_t {
   Adam,

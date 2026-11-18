@@ -19,6 +19,9 @@ constexpr uint16_t    kMqttPort  = 1883;
 constexpr const char* kMqttTopicSensor = "TinyAE/sensor";
 constexpr const char* kMqttTopicInfer  = "TinyAE/infer";
 constexpr const char* kMqttTopicTrain  = "TinyAE/train";
+constexpr const char* kMqttTopicCmd    = "TinyAE/cmd";   // subscribe: <cmd>/<MAC>, <cmd>/all
+constexpr const char* kMqttTopicResp   = "TinyAE/resp";  // publish:   <resp>/<MAC>
+constexpr const char* kMqttTopicAlert  = "TinyAE/alert"; // publish: immediate anomaly events
 constexpr const char* kTimezone  = "KST-9";
 
 // SD card SPI pins (LOLIN S3 Pro onboard micro-SD).

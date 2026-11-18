@@ -39,8 +39,9 @@ def export_aifes_bin(model: TinyAE, output_path: str) -> int:
     flat: list[float] = []
     for layer in model.modules():
         if isinstance(layer, torch.nn.Linear):
-            flat.extend(layer.weight.data.cpu().float().numpy().flatten().tolist())
-            flat.extend(layer.bias.data.cpu().float().numpy().tolist())
+            # torch-native flatten/tolist (avoids .numpy(), which breaks under NumPy 2.x)
+            flat.extend(layer.weight.data.cpu().float().flatten().tolist())
+            flat.extend(layer.bias.data.cpu().float().flatten().tolist())
 
     weight_count = len(flat)
 

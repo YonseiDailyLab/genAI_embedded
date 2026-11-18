@@ -11,13 +11,15 @@ namespace {
 
 static const char *TAG = "AIfES_AE";
 
-// 60 -> 16 -> 4 -> 16 -> 60
-// Input: 10 features × 6 statistics (mean, std, min, max, slope, curvature).
-// Bottleneck of 4 forces compact latent representation of normal behavior.
+// 90 -> 32 -> 6 -> 32 -> 90
+// Input: 15 features × 6 statistics (mean, std, min, max, slope, curvature).
+// Bottleneck of 6 forces compact latent representation of normal behavior.
+// Matches pretrain/model.py (TinyAE 90-32-6-32-90) so PyTorch weights exported
+// via pretrain/export.py load directly (weight_count = 6304).
 constexpr uint32_t kLayerCount = 5;
 
 uint32_t s_structure[kLayerCount] = {
-    tinyae::ml::kAutoencoderInputDim, 16, 4, 16,
+    tinyae::ml::kAutoencoderInputDim, 32, 6, 32,
     tinyae::ml::kAutoencoderInputDim};
 AIFES_E_activations s_activations[kLayerCount - 1] = {
     AIfES_E_relu, AIfES_E_linear, AIfES_E_relu, AIfES_E_sigmoid};

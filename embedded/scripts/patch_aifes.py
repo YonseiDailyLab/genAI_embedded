@@ -87,15 +87,40 @@ def patch_q7_quant_leak(file_path: Path) -> bool:
     return True
 
 
+# Newer espressif32 toolchains promote several -Wmaybe-uninitialized warnings
+# in the third-party AIfES sources to errors, and neither project build_flags
+# nor env CCFLAGS reach these library compile units. Disable the warning at the
+# source level by prepending a pragma to every AIfES .c file (idempotent).
+_MU_PRAGMA = '#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"\n'
+
+
+def disable_maybe_uninitialized(src_root: Path) -> int:
+    count = 0
+    for c_file in src_root.rglob("*.c"):
+        text = c_file.read_text(encoding="utf-8", errors="ignore")
+        if _MU_PRAGMA in text:
+            continue
+        c_file.write_text(_MU_PRAGMA + text, encoding="utf-8")
+        count += 1
+    return count
+
+
 project_dir = Path(env["PROJECT_DIR"])
 libdeps_dir = project_dir / ".pio" / "libdeps"
 
 if libdeps_dir.exists():
     for env_dir in libdeps_dir.iterdir():
-        candidate = env_dir / "AIfES for Arduino" / "src" / "basic" / "express" / "aifes_express_q7_fnn.c"
-        if not candidate.exists():
+        aifes_root = env_dir / "AIfES for Arduino" / "src"
+        if not aifes_root.exists():
             continue
-        if patch_q7_quant_dump(candidate):
-            print(f"[patch_aifes] Patched debug dump: {candidate}")
-        if patch_q7_quant_leak(candidate):
-            print(f"[patch_aifes] Patched quantization leak: {candidate}")
+
+        candidate = aifes_root / "basic" / "express" / "aifes_express_q7_fnn.c"
+        if candidate.exists():
+            if patch_q7_quant_dump(candidate):
+                print(f"[patch_aifes] Patched debug dump: {candidate}")
+            if patch_q7_quant_leak(candidate):
+                print(f"[patch_aifes] Patched quantization leak: {candidate}")
+
+        n = disable_maybe_uninitialized(aifes_root)
+        if n:
+            print(f"[patch_aifes] Disabled -Wmaybe-uninitialized in {n} AIfES source file(s)")

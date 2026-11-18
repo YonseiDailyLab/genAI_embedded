@@ -30,9 +30,9 @@ namespace {
 
 static const char* TAG = "TinyAE_Pipe";
 
-// AE input = 10 features × 6 statistics = 60.
-constexpr uint32_t kSampleDim     = tinyae::ml::kAutoencoderInputDim;  // 60
-constexpr uint32_t kFeatureDim    = tinyae::data::kFeatureCount;        // 10
+// AE input = 15 features × 6 statistics = 90.
+constexpr uint32_t kSampleDim     = tinyae::ml::kAutoencoderInputDim;  // 90
+constexpr uint32_t kFeatureDim    = tinyae::data::kFeatureCount;        // 15
 constexpr uint32_t kStatsWindowSz = 300;  // rolling history buffer size (seconds)
 constexpr uint32_t kTrainStride   = 150;  // push new training sample every N seconds
 constexpr uint32_t kInferInterval = 60;   // run inference every N seconds (real-time)
@@ -58,25 +58,35 @@ struct MqttWindowData {
   int      co2[kMqttWindowSz];
   int      pm10[kMqttWindowSz];
   int      pm25[kMqttWindowSz];
-  float    bmp_temp[kMqttWindowSz];
-  int32_t  bmp_pressure[kMqttWindowSz];
   int      mp801_raw[kMqttWindowSz];
-  int      mq7_raw[kMqttWindowSz];
   int      mq131_o3_ppb[kMqttWindowSz];
+  int      co_sen0564_raw[kMqttWindowSz];
+  int      mics2714_raw[kMqttWindowSz];
+  float    bme_temp[kMqttWindowSz];
+  float    bme_humidity[kMqttWindowSz];
+  int32_t  bme_pressure[kMqttWindowSz];
+  int      ens_aqi[kMqttWindowSz];
+  int      ens_tvoc_ppb[kMqttWindowSz];
+  int      ens_eco2_ppm[kMqttWindowSz];
+  // Device's own verdict at the moment this window was handed off.
+  uint8_t  severity;
+  float    ae_mse;
+  bool     verdict_ready;
 };
 
 // Small MQTT message (inference result, training log).
 // Published by mqtt_task; enqueued by infer/train tasks without network I/O.
 struct MqttSmallMsg {
   char topic[48];
-  char payload[256];
+  char payload[512];   // 512: a `latest` command reply carries all 15 channels
 };
 
 // Queue of MqttWindowData* pointers (depth 2: sensor window).
 static QueueHandle_t s_mqtt_queue = nullptr;
 
-// Queue of MqttSmallMsg values (depth 8: infer + train results).
+// Queue of MqttSmallMsg values (depth 8: infer + train results, command replies).
 static QueueHandle_t s_mqtt_msg_queue = nullptr;
+
 
 // PSRAM-backed static pool (2 slots, ping-pong) for MqttWindowData.
 // Permanently allocated once; eliminates 60-s malloc/free fragmentation.
@@ -115,6 +125,19 @@ struct Context {
   uint32_t          ring_count   = 0;
   bool              anom_since_last_push = false;  // set by infer, cleared by comm on ring push
 
+  // Snapshot of the newest raw sample + sample counter, for on-demand pull
+  // queries (TinyAE/cmd). Written by comm_task, read by the command handler.
+  tinyae::data::SensorReading latest_reading;
+  bool                        latest_valid = false;
+  uint32_t                    sensor_count = 0;
+
+  // Newest on-device inference verdict. Written by inference_task; read by
+  // comm_task (to stamp the sensor window) and by the command handler.
+  uint8_t  latest_severity   = 0;      // AnomalySeverity value
+  float    latest_mse        = 0.0f;
+  bool     verdict_ready     = false;  // thresholds exist -> severity is meaningful
+  uint32_t baseline_progress = 0;      // normal-MSE samples collected so far
+  uint32_t baseline_target   = 0;      // samples needed before verdict_ready
 };
 
 Context g_ctx;
@@ -133,8 +156,10 @@ static void* malloc_psram_prefer(size_t bytes) {
 // Binary format: 4-byte magic | 4-byte weight_count | weight_count × float
 // ---------------------------------------------------------------------------
 static constexpr uint32_t kModelFileMagic      = 0x54414503u;  // 'TAE\x03'
-static constexpr uint32_t kSaveIntervalRounds  = 5;            // save every N rounds
+static constexpr uint32_t kSaveIntervalMs      = 10u * 60u * 1000u;  // >= 10 min apart
 static const char* kModelFilePath              = "/models/ae_model.bin";
+// 8.3-safe temp name (FatFs LFN is disabled): written first, then renamed.
+static const char* kModelTmpPath               = "/models/ae_model.tmp";
 
 // Save weights to /ae_model.bin. Call with staging_weights BEFORE the swap
 // (staging = just-trained model; no mutex needed — only training_task touches it here).
@@ -142,19 +167,35 @@ static void sd_save_model(const float* weights, uint32_t weight_count, uint32_t 
   if (!s_sd_ok || s_sd_mutex == nullptr) return;
   if (xSemaphoreTake(s_sd_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
 
-  File f = SD.open(kModelFilePath, "w");  // "w" = create/truncate
+  // Write to a temp file and rename, so losing power mid-write cannot destroy
+  // the previously saved model.
+  File f = SD.open(kModelTmpPath, "w");  // "w" = create/truncate
   if (!f) {
-    ESP_LOGW(TAG, "[SD] Cannot open %s for write", kModelFilePath);
+    ESP_LOGW(TAG, "[SD] Cannot open %s for write", kModelTmpPath);
     xSemaphoreGive(s_sd_mutex);
     return;
   }
 
-  f.write((const uint8_t*)&kModelFileMagic, 4);
-  f.write((const uint8_t*)&weight_count, 4);
-  f.write((const uint8_t*)weights, weight_count * sizeof(float));
+  const size_t nbytes = (size_t)weight_count * sizeof(float);
+  bool ok = (f.write((const uint8_t*)&kModelFileMagic, 4) == 4);
+  ok = ok && (f.write((const uint8_t*)&weight_count, 4) == 4);
+  ok = ok && (f.write((const uint8_t*)weights, nbytes) == nbytes);
   f.close();
 
-  ESP_LOGI(TAG, "[SD] Model saved (round=%u, %u floats)", (unsigned)round, (unsigned)weight_count);
+  if (!ok) {
+    ESP_LOGW(TAG, "[SD] Model write incomplete -> previous file kept");
+    SD.remove(kModelTmpPath);
+    xSemaphoreGive(s_sd_mutex);
+    return;
+  }
+
+  SD.remove(kModelFilePath);   // rename() will not overwrite an existing target
+  if (SD.rename(kModelTmpPath, kModelFilePath)) {
+    ESP_LOGI(TAG, "[SD] Model saved (round=%u, %u floats)",
+             (unsigned)round, (unsigned)weight_count);
+  } else {
+    ESP_LOGW(TAG, "[SD] Model rename failed (temp kept at %s)", kModelTmpPath);
+  }
   xSemaphoreGive(s_sd_mutex);
 }
 
@@ -233,11 +274,19 @@ static void build_payload(
     const int*     co2_arr,
     const int*     pm10_arr,
     const int*     pm25_arr,
-    const float*   bmp_temp_arr,
-    const int32_t* bmp_pressure_arr,
     const int*     mp801_raw_arr,
-    const int*     mq7_raw_arr,
-    const int*     mq131_o3_ppb_arr) {
+    const int*     mq131_o3_ppb_arr,
+    const int*     co_sen0564_raw_arr,
+    const int*     mics2714_raw_arr,
+    const float*   bme_temp_arr,
+    const float*   bme_humidity_arr,
+    const int32_t* bme_pressure_arr,
+    const int*     ens_aqi_arr,
+    const int*     ens_tvoc_ppb_arr,
+    const int*     ens_eco2_ppm_arr,
+    uint8_t        severity,
+    float          ae_mse,
+    bool           verdict_ready) {
   p = "";
 
   char seq_buf[8];
@@ -251,15 +300,27 @@ static void build_payload(
   p += "\"window\":{\"start\":"; p += String((uint32_t)start_ts);
   p += ",\"end\":"; p += String((uint32_t)end_ts);
   p += ",\"size\":"; p += String(kMqttWindowSz); p += "},";
-  p += "\"metadata\":{\"feature_dim\":10,";
+  p += "\"metadata\":{\"feature_dim\":15,";
   p += "\"location\":{\"lat\":37.5663,\"lon\":126.9432},";
-  p += "\"anomaly_flag\":false,";
+  // Device verdict (on-device TinyML). While the baseline is still building,
+  // severity reports "warming" and anomaly_flag stays false.
+  static const char* kSevNames[] = {"normal", "warning", "anomaly", "severe"};
+  const char* sev_name = verdict_ready
+                         ? kSevNames[(severity < 4) ? severity : 0]
+                         : "warming";
+  p += "\"anomaly_flag\":";
+  p += (verdict_ready && severity >= 2) ? "true" : "false";
+  p += ",\"severity\":\""; p += sev_name; p += "\",";
+  p += "\"ae_mse\":"; p += String(ae_mse, 6); p += ",";
   p += "\"disaster_type\":{\"main_tag\":\"fire\",\"sub_tag\":[\"wild fire\"]},";
   p += "\"sensor\":{\"device_id\":\""; p += mac_id; p += "\",\"sampling_hz\":1,";
   p += "\"units\":{\"Temperature\":\"C\",\"Humidity\":\"%\",\"CO2\":\"ppm\",";
-  p += "\"PM10\":\"ug/m3\",\"PM2.5\":\"ug/m3\",\"BMP_Temp\":\"C\",";
-  p += "\"BMP_Pressure_Pa\":\"Pa\",\"MP801_raw\":\"analog_val\",";
-  p += "\"MQ7_raw\":\"analog_val\",\"MQ131_O3_ppb\":\"ppb\"}},";
+  p += "\"PM10\":\"ug/m3\",\"PM2.5\":\"ug/m3\",\"MP801_raw\":\"analog_val\",";
+  p += "\"MQ131_O3_ppb\":\"ppb\",\"CO_SEN0564_raw\":\"analog_val\",";
+  p += "\"MiCS2714_raw\":\"analog_val\",\"BME_Temp\":\"C\",";
+  p += "\"BME_Humidity\":\"%\",\"BME_Pressure_Pa\":\"Pa\",";
+  p += "\"ENS_AQI\":\"level_1_5\",\"ENS_TVOC_ppb\":\"ppb\",";
+  p += "\"ENS_eCO2_ppm\":\"ppm\"}},";
   p += "\"updated_at\":"; p += String((uint32_t)time(nullptr)); p += "},";
   p += "\"data\":{\"blob_uri\":\"\",";
 
@@ -280,28 +341,33 @@ static void build_payload(
     p += "],";
   };
 
-  arr_f("Temperature", temperature_arr);
-  arr_f("Humidity",    humidity_arr);
-  arr_i("CO2",         co2_arr);
-  arr_i("PM10",        pm10_arr);
-  arr_i("PM2.5",       pm25_arr);
-  arr_f("BMP_Temp",    bmp_temp_arr);
+  arr_f("Temperature",    temperature_arr);
+  arr_f("Humidity",       humidity_arr);
+  arr_i("CO2",            co2_arr);
+  arr_i("PM10",           pm10_arr);
+  arr_i("PM2.5",          pm25_arr);
+  arr_i("MP801_raw",      mp801_raw_arr);
+  arr_i("MQ131_O3_ppb",   mq131_o3_ppb_arr);
+  arr_i("CO_SEN0564_raw", co_sen0564_raw_arr);
+  arr_i("MiCS2714_raw",   mics2714_raw_arr);
+  arr_f("BME_Temp",       bme_temp_arr);
+  arr_f("BME_Humidity",   bme_humidity_arr);
 
-  // BMP_Pressure_Pa (int32_t).
-  p += "\"BMP_Pressure_Pa\":[";
+  // BME_Pressure_Pa (int32_t).
+  p += "\"BME_Pressure_Pa\":[";
   for (uint32_t i = 0; i < kMqttWindowSz; i++) {
-    p += String(bmp_pressure_arr[i]);
+    p += String(bme_pressure_arr[i]);
     if (i < kMqttWindowSz - 1) p += ",";
   }
   p += "],";
 
-  arr_i("MP801_raw", mp801_raw_arr);
-  arr_i("MQ7_raw",   mq7_raw_arr);
+  arr_i("ENS_AQI",      ens_aqi_arr);
+  arr_i("ENS_TVOC_ppb", ens_tvoc_ppb_arr);
 
-  // MQ131_O3_ppb: last field, no trailing comma.
-  p += "\"MQ131_O3_ppb\":[";
+  // ENS_eCO2_ppm: last field, no trailing comma.
+  p += "\"ENS_eCO2_ppm\":[";
   for (uint32_t i = 0; i < kMqttWindowSz; i++) {
-    p += String(mq131_o3_ppb_arr[i]);
+    p += String(ens_eco2_ppm_arr[i]);
     if (i < kMqttWindowSz - 1) p += ",";
   }
   p += "]}}";
@@ -350,18 +416,21 @@ static void sd_write_sensor(const tinyae::data::SensorReading& r, time_t ts) {
   }
   if (f.size() == 0) {
     f.println("timestamp,temperature,humidity,co2,pm10,pm25,"
-              "bmp_temp,bmp_pressure,mp801_raw,mq7_raw,mq131_o3_ppb");
+              "mp801_raw,mq131_o3_ppb,co_sen0564_raw,mics2714_raw,"
+              "bme_temp,bme_humidity,bme_pressure,"
+              "ens_aqi,ens_tvoc_ppb,ens_eco2_ppm");
   }
   char tsbuf[20];
   fmt_ts(ts, tsbuf, sizeof(tsbuf));
-  char line[210];
+  char line[256];
   snprintf(line, sizeof(line),
-           "%s,%.2f,%.2f,%d,%d,%d,%.2f,%ld,%d,%d,%d",
+           "%s,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%ld,%d,%d,%d",
            tsbuf,
            r.temperature, r.humidity,
            r.co2, r.pm10, r.pm25,
-           r.bmp_temp, (long)r.bmp_pressure,
-           r.mp801_raw, r.mq7_raw, r.mq131_o3_ppb);
+           r.mp801_raw, r.mq131_o3_ppb, r.co_sen0564_raw, r.mics2714_raw,
+           r.bme_temp, r.bme_humidity, (long)r.bme_pressure,
+           r.ens_aqi, r.ens_tvoc_ppb, r.ens_eco2_ppm);
   f.println(line);
   f.close();
   xSemaphoreGive(s_sd_mutex);
@@ -511,16 +580,21 @@ static void on_anomaly_event(AnomalySeverity severity,
            severity_str(severity), (unsigned)version, mse,
            thr_warn, thr_anom, thr_severe, (unsigned long)ts);
 
-  // TODO: build JSON and transmit.
-  // Example (HTTP POST pseudo-code):
-  //   char body[256];
-  //   snprintf(body, sizeof(body),
-  //            "{\"type\":\"anomaly_event\",\"severity\":\"%s\","
-  //            "\"timestamp\":%lu,\"model_version\":%u,\"mse\":%.6f,"
-  //            "\"thresholds\":{\"warn\":%.6f,\"anom\":%.6f,\"severe\":%.6f}}",
-  //            severity_str(severity), (unsigned long)ts, version, mse,
-  //            thr_warn, thr_anom, thr_severe);
-  //   http_post("http://192.168.0.12:8080/api/anomaly", body);
+  // Immediate push on a dedicated topic so the edge does not have to wait for
+  // the next periodic window. Enqueued for mqtt_task — this runs on
+  // inference_task and must not touch the network directly.
+  if (s_mqtt_msg_queue == nullptr) return;
+
+  MqttSmallMsg msg;
+  strncpy(msg.topic, tinyae::app::kMqttTopicAlert, sizeof(msg.topic) - 1);
+  msg.topic[sizeof(msg.topic) - 1] = '\0';
+  snprintf(msg.payload, sizeof(msg.payload),
+           "{\"type\":\"anomaly_event\",\"severity\":\"%s\",\"ts\":%lu,"
+           "\"v\":%u,\"mse\":%.6f,"
+           "\"thresholds\":{\"warn\":%.6f,\"anom\":%.6f,\"severe\":%.6f}}",
+           severity_str(severity), (unsigned long)ts, (unsigned)version, mse,
+           thr_warn, thr_anom, thr_severe);
+  xQueueSend(s_mqtt_msg_queue, &msg, 0);   // drop if full; never block
 }
 
 // ---------------------------------------------------------------------------
@@ -547,11 +621,16 @@ void comm_task(void* parameter) {
   static int     s_co2_arr[kMqttWindowSz];
   static int     s_pm10_arr[kMqttWindowSz];
   static int     s_pm25_arr[kMqttWindowSz];
-  static float   s_bmp_temp_arr[kMqttWindowSz];
-  static int32_t s_bmp_pressure_arr[kMqttWindowSz];
   static int     s_mp801_raw_arr[kMqttWindowSz];
-  static int     s_mq7_raw_arr[kMqttWindowSz];
   static int     s_mq131_o3_ppb_arr[kMqttWindowSz];
+  static int     s_co_sen0564_raw_arr[kMqttWindowSz];
+  static int     s_mics2714_raw_arr[kMqttWindowSz];
+  static float   s_bme_temp_arr[kMqttWindowSz];
+  static float   s_bme_humidity_arr[kMqttWindowSz];
+  static int32_t s_bme_pressure_arr[kMqttWindowSz];
+  static int     s_ens_aqi_arr[kMqttWindowSz];
+  static int     s_ens_tvoc_ppb_arr[kMqttWindowSz];
+  static int     s_ens_eco2_ppm_arr[kMqttWindowSz];
   static uint32_t s_mqtt_idx;
   static time_t   s_mqtt_window_start;
   static uint32_t s_event_seq = 1;
@@ -564,14 +643,25 @@ void comm_task(void* parameter) {
     float features[kFeatureDim] = {};
     tinyae::data::sensor_to_feature_vec(r, features);
 
-    ESP_LOGI(TAG, "[SENSOR] T=%.1f H=%.1f CO2=%d PM10=%d PM2.5=%d O3=%dppb MP801=%d MQ7=%d",
+    ESP_LOGI(TAG, "[SENSOR] T=%.1f H=%.1f CO2=%d PM10=%d PM2.5=%d O3=%dppb "
+                  "MP801=%d CO=%d MiCS=%d | BME T=%.1f H=%.1f P=%ld | "
+                  "ENS AQI=%d TVOC=%d eCO2=%d",
              r.temperature, r.humidity, r.co2, r.pm10, r.pm25,
-             r.mq131_o3_ppb, r.mp801_raw, r.mq7_raw);
+             r.mq131_o3_ppb, r.mp801_raw, r.co_sen0564_raw, r.mics2714_raw,
+             r.bme_temp, r.bme_humidity, (long)r.bme_pressure,
+             r.ens_aqi, r.ens_tvoc_ppb, r.ens_eco2_ppm);
 
     // 2. Write normalized features into circular history buffer.
     const uint32_t h_pos = s_sensor_count % kStatsWindowSz;
     memcpy(s_feat_hist[h_pos], features, sizeof(float) * kFeatureDim);
     s_sensor_count++;
+
+    // Snapshot newest raw sample for on-demand pull queries (TinyAE/cmd).
+    xSemaphoreTake(ctx->sample_mutex, portMAX_DELAY);
+    ctx->latest_reading = r;
+    ctx->latest_valid   = true;
+    ctx->sensor_count   = s_sensor_count;
+    xSemaphoreGive(ctx->sample_mutex);
 
     // 3. Check whether inference or training should fire this tick.
     //    avail = samples available (grows until kStatsWindowSz, then stays there).
@@ -644,16 +734,21 @@ void comm_task(void* parameter) {
       }
     }
 
-    s_temperature_arr[s_mqtt_idx]  = r.temperature;
-    s_humidity_arr[s_mqtt_idx]     = r.humidity;
-    s_co2_arr[s_mqtt_idx]          = r.co2;
-    s_pm10_arr[s_mqtt_idx]         = r.pm10;
-    s_pm25_arr[s_mqtt_idx]         = r.pm25;
-    s_bmp_temp_arr[s_mqtt_idx]     = r.bmp_temp;
-    s_bmp_pressure_arr[s_mqtt_idx] = r.bmp_pressure;
-    s_mp801_raw_arr[s_mqtt_idx]    = r.mp801_raw;
-    s_mq7_raw_arr[s_mqtt_idx]      = r.mq7_raw;
-    s_mq131_o3_ppb_arr[s_mqtt_idx] = r.mq131_o3_ppb;
+    s_temperature_arr[s_mqtt_idx]    = r.temperature;
+    s_humidity_arr[s_mqtt_idx]       = r.humidity;
+    s_co2_arr[s_mqtt_idx]            = r.co2;
+    s_pm10_arr[s_mqtt_idx]           = r.pm10;
+    s_pm25_arr[s_mqtt_idx]           = r.pm25;
+    s_mp801_raw_arr[s_mqtt_idx]      = r.mp801_raw;
+    s_mq131_o3_ppb_arr[s_mqtt_idx]   = r.mq131_o3_ppb;
+    s_co_sen0564_raw_arr[s_mqtt_idx] = r.co_sen0564_raw;
+    s_mics2714_raw_arr[s_mqtt_idx]   = r.mics2714_raw;
+    s_bme_temp_arr[s_mqtt_idx]       = r.bme_temp;
+    s_bme_humidity_arr[s_mqtt_idx]   = r.bme_humidity;
+    s_bme_pressure_arr[s_mqtt_idx]   = r.bme_pressure;
+    s_ens_aqi_arr[s_mqtt_idx]        = r.ens_aqi;
+    s_ens_tvoc_ppb_arr[s_mqtt_idx]   = r.ens_tvoc_ppb;
+    s_ens_eco2_ppm_arr[s_mqtt_idx]   = r.ens_eco2_ppm;
     s_mqtt_idx++;
 
     // 5. When window full, hand off to mqtt_task (non-blocking, no network I/O here).
@@ -666,16 +761,28 @@ void comm_task(void* parameter) {
       if (wd != nullptr) {
         wd->window_start = s_mqtt_window_start;
         wd->event_seq    = s_event_seq;
-        memcpy(wd->temperature,  s_temperature_arr,   sizeof(float)   * kMqttWindowSz);
-        memcpy(wd->humidity,     s_humidity_arr,      sizeof(float)   * kMqttWindowSz);
-        memcpy(wd->co2,          s_co2_arr,           sizeof(int)     * kMqttWindowSz);
-        memcpy(wd->pm10,         s_pm10_arr,          sizeof(int)     * kMqttWindowSz);
-        memcpy(wd->pm25,         s_pm25_arr,          sizeof(int)     * kMqttWindowSz);
-        memcpy(wd->bmp_temp,     s_bmp_temp_arr,      sizeof(float)   * kMqttWindowSz);
-        memcpy(wd->bmp_pressure, s_bmp_pressure_arr,  sizeof(int32_t) * kMqttWindowSz);
-        memcpy(wd->mp801_raw,    s_mp801_raw_arr,     sizeof(int)     * kMqttWindowSz);
-        memcpy(wd->mq7_raw,      s_mq7_raw_arr,       sizeof(int)     * kMqttWindowSz);
-        memcpy(wd->mq131_o3_ppb, s_mq131_o3_ppb_arr,  sizeof(int)     * kMqttWindowSz);
+        memcpy(wd->temperature,    s_temperature_arr,    sizeof(float)   * kMqttWindowSz);
+        memcpy(wd->humidity,       s_humidity_arr,       sizeof(float)   * kMqttWindowSz);
+        memcpy(wd->co2,            s_co2_arr,            sizeof(int)     * kMqttWindowSz);
+        memcpy(wd->pm10,           s_pm10_arr,           sizeof(int)     * kMqttWindowSz);
+        memcpy(wd->pm25,           s_pm25_arr,           sizeof(int)     * kMqttWindowSz);
+        memcpy(wd->mp801_raw,      s_mp801_raw_arr,      sizeof(int)     * kMqttWindowSz);
+        memcpy(wd->mq131_o3_ppb,   s_mq131_o3_ppb_arr,   sizeof(int)     * kMqttWindowSz);
+        memcpy(wd->co_sen0564_raw, s_co_sen0564_raw_arr, sizeof(int)     * kMqttWindowSz);
+        memcpy(wd->mics2714_raw,   s_mics2714_raw_arr,   sizeof(int)     * kMqttWindowSz);
+        memcpy(wd->bme_temp,       s_bme_temp_arr,       sizeof(float)   * kMqttWindowSz);
+        memcpy(wd->bme_humidity,   s_bme_humidity_arr,   sizeof(float)   * kMqttWindowSz);
+        memcpy(wd->bme_pressure,   s_bme_pressure_arr,   sizeof(int32_t) * kMqttWindowSz);
+        memcpy(wd->ens_aqi,        s_ens_aqi_arr,        sizeof(int)     * kMqttWindowSz);
+        memcpy(wd->ens_tvoc_ppb,   s_ens_tvoc_ppb_arr,   sizeof(int)     * kMqttWindowSz);
+        memcpy(wd->ens_eco2_ppm,   s_ens_eco2_ppm_arr,   sizeof(int)     * kMqttWindowSz);
+
+        // Stamp the window with the device's own latest verdict.
+        xSemaphoreTake(ctx->sample_mutex, portMAX_DELAY);
+        wd->severity      = ctx->latest_severity;
+        wd->ae_mse        = ctx->latest_mse;
+        wd->verdict_ready = ctx->verdict_ready;
+        xSemaphoreGive(ctx->sample_mutex);
 
         if (xQueueSend(s_mqtt_queue, &wd, 0) != pdTRUE) {
           ESP_LOGW(TAG, "[MQTT] queue full, dropping window");
@@ -688,6 +795,90 @@ void comm_task(void* parameter) {
     // 6. Maintain strict 1 Hz timing (network ops no longer block this path).
     vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000));
   }
+}
+
+// ---------------------------------------------------------------------------
+// On-demand pull: commands arrive on TinyAE/cmd/<MAC> (or /all); the reply is
+// published to TinyAE/resp/<MAC>. This runs inside client.loop() on mqtt_task,
+// so it only reads shared snapshots and enqueues — it must never block.
+// Accepts a bare word ("status") or {"cmd":"status"}.
+// ---------------------------------------------------------------------------
+static String s_mac_id;
+static char   s_resp_topic[64] = {0};
+
+static void mqtt_command_cb(char* /*topic*/, uint8_t* payload, unsigned int length) {
+  char buf[96];
+  const unsigned int n = (length < sizeof(buf) - 1) ? length : sizeof(buf) - 1;
+  memcpy(buf, payload, n);
+  buf[n] = '\0';
+
+  const char* cmd = buf;
+  const char* q   = strstr(buf, "\"cmd\"");
+  if (q != nullptr) {
+    q = strchr(q + 5, '"');
+    if (q != nullptr) cmd = q + 1;
+  }
+
+  MqttSmallMsg msg;
+  strncpy(msg.topic, s_resp_topic, sizeof(msg.topic) - 1);
+  msg.topic[sizeof(msg.topic) - 1] = '\0';
+
+  if (strncmp(cmd, "ping", 4) == 0) {
+    snprintf(msg.payload, sizeof(msg.payload),
+             "{\"dev\":\"%s\",\"cmd\":\"ping\",\"up\":%lu}",
+             s_mac_id.c_str(), (unsigned long)(millis() / 1000));
+
+  } else if (strncmp(cmd, "status", 6) == 0) {
+    uint32_t version = 0, n_samples = 0;
+    bool     preloaded = false;
+    if (xSemaphoreTake(g_ctx.weights_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      version   = g_ctx.model_version;
+      preloaded = g_ctx.weights_preloaded;
+      xSemaphoreGive(g_ctx.weights_mutex);
+    }
+    if (xSemaphoreTake(g_ctx.sample_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      n_samples = g_ctx.sensor_count;
+      xSemaphoreGive(g_ctx.sample_mutex);
+    }
+    snprintf(msg.payload, sizeof(msg.payload),
+             "{\"dev\":\"%s\",\"cmd\":\"status\",\"up\":%lu,\"v\":%u,\"pre\":%d,"
+             "\"n\":%u,\"sd\":%d,\"heap\":%u,\"psram\":%u,\"rssi\":%d,\"r0\":%.2f}",
+             s_mac_id.c_str(), (unsigned long)(millis() / 1000), (unsigned)version,
+             preloaded ? 1 : 0, (unsigned)n_samples, s_sd_ok ? 1 : 0,
+             (unsigned)ESP.getFreeHeap(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (int)WiFi.RSSI(), tinyae::data::sensors_mq131_r0());
+
+  } else if (strncmp(cmd, "latest", 6) == 0) {
+    tinyae::data::SensorReading r;
+    bool valid = false;
+    if (xSemaphoreTake(g_ctx.sample_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      r     = g_ctx.latest_reading;
+      valid = g_ctx.latest_valid;
+      xSemaphoreGive(g_ctx.sample_mutex);
+    }
+    if (!valid) {
+      snprintf(msg.payload, sizeof(msg.payload),
+               "{\"dev\":\"%s\",\"cmd\":\"latest\",\"err\":\"no sample yet\"}",
+               s_mac_id.c_str());
+    } else {
+      snprintf(msg.payload, sizeof(msg.payload),
+               "{\"dev\":\"%s\",\"cmd\":\"latest\",\"t\":%.2f,\"h\":%.2f,\"co2\":%d,"
+               "\"pm10\":%d,\"pm25\":%d,\"mp801\":%d,\"o3\":%d,\"co\":%d,\"mics\":%d,"
+               "\"bt\":%.2f,\"bh\":%.2f,\"bp\":%ld,\"aqi\":%d,\"tvoc\":%d,\"eco2\":%d}",
+               s_mac_id.c_str(), r.temperature, r.humidity, r.co2, r.pm10, r.pm25,
+               r.mp801_raw, r.mq131_o3_ppb, r.co_sen0564_raw, r.mics2714_raw,
+               r.bme_temp, r.bme_humidity, (long)r.bme_pressure,
+               r.ens_aqi, r.ens_tvoc_ppb, r.ens_eco2_ppm);
+    }
+
+  } else {
+    snprintf(msg.payload, sizeof(msg.payload),
+             "{\"dev\":\"%s\",\"err\":\"unknown cmd\","
+             "\"accepts\":[\"ping\",\"status\",\"latest\"]}", s_mac_id.c_str());
+  }
+
+  if (s_mqtt_msg_queue != nullptr) xQueueSend(s_mqtt_msg_queue, &msg, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -705,14 +896,24 @@ void mqtt_task(void* /*parameter*/) {
   snprintf(client_id, sizeof(client_id), "TinyAE_%s", mac_id.c_str());
   ESP_LOGI(TAG, "mqtt_task start: clientId=%s", client_id);
 
+  // On-demand pull wiring: listen on <cmd>/<MAC> and <cmd>/all, reply on <resp>/<MAC>.
+  char cmd_topic[64], cmd_all[64];
+  snprintf(cmd_topic, sizeof(cmd_topic), "%s/%s", tinyae::app::kMqttTopicCmd, mac_id.c_str());
+  snprintf(cmd_all,   sizeof(cmd_all),   "%s/all", tinyae::app::kMqttTopicCmd);
+  snprintf(s_resp_topic, sizeof(s_resp_topic), "%s/%s",
+           tinyae::app::kMqttTopicResp, mac_id.c_str());
+  s_mac_id = mac_id;
+  client.setCallback(mqtt_command_cb);
+
   // Pre-allocate payload String once; reused every 60 s (no DRAM heap churn).
   static String s_payload;
   s_payload.reserve(9000);
 
   for (;;) {
-    // Block up to 5 s for new data; use the idle time for keepalive.
+    // Block up to 1 s for new data; the idle time drives keepalive and, just as
+    // importantly, client.loop() — which is where inbound commands are dispatched.
     MqttWindowData* wd = nullptr;
-    const BaseType_t got = xQueueReceive(s_mqtt_queue, &wd, pdMS_TO_TICKS(5000));
+    const BaseType_t got = xQueueReceive(s_mqtt_queue, &wd, pdMS_TO_TICKS(1000));
 
     // Reconnect WiFi only when in a terminal failure state (not while connecting).
     // Rate-limited to one attempt per 15 s to avoid rapid disconnect/begin churn.
@@ -733,6 +934,10 @@ void mqtt_task(void* /*parameter*/) {
     if (WiFi.status() == WL_CONNECTED && !client.connected()) {
       if (client.connect(client_id)) {
         ESP_LOGI(TAG, "[MQTT] connected to %s:%u", tinyae::app::kMqttHost, tinyae::app::kMqttPort);
+        client.subscribe(cmd_topic);
+        client.subscribe(cmd_all);
+        ESP_LOGI(TAG, "[MQTT] subscribed: %s | %s -> reply %s",
+                 cmd_topic, cmd_all, s_resp_topic);
       } else {
         ESP_LOGW(TAG, "[MQTT] connect failed (state=%d), retry in 5 s", client.state());
       }
@@ -751,8 +956,10 @@ void mqtt_task(void* /*parameter*/) {
             s_payload,
             wd->window_start, window_end, wd->event_seq, mac_id,
             wd->temperature, wd->humidity, wd->co2, wd->pm10, wd->pm25,
-            wd->bmp_temp, wd->bmp_pressure, wd->mp801_raw, wd->mq7_raw,
-            wd->mq131_o3_ppb);
+            wd->mp801_raw, wd->mq131_o3_ppb, wd->co_sen0564_raw, wd->mics2714_raw,
+            wd->bme_temp, wd->bme_humidity, wd->bme_pressure,
+            wd->ens_aqi, wd->ens_tvoc_ppb, wd->ens_eco2_ppm,
+            wd->severity, wd->ae_mse, wd->verdict_ready);
         const bool ok = client.publish(tinyae::app::kMqttTopicSensor, s_payload.c_str());
         ESP_LOGI(TAG, "[MQTT] publish %s len=%u win=%u..%u",
                  ok ? "OK" : "FAIL", (unsigned)s_payload.length(),
@@ -783,7 +990,10 @@ void inference_task(void* parameter) {
   auto* ctx = static_cast<Context*>(parameter);
 
   constexpr uint32_t kNormalMseCapacity        = 256;
-  constexpr uint32_t kNormalMseMinForThreshold = 64;
+  // 20 inference cycles (~20 min at kInferInterval=60 s) before thresholds are
+  // trusted. Lower than 64 so a rebooted device can judge sooner; still enough
+  // samples for a usable IQR.
+  constexpr uint32_t kNormalMseMinForThreshold = 20;
   constexpr uint32_t kThrCount   = 3;
   constexpr uint32_t kThrWarn    = 0;  // Q3 + 1.5*IQR  (~0.7% FP)
   constexpr uint32_t kThrAnom    = 1;  // Q3 + 3.0*IQR  (~0.01% FP)
@@ -926,16 +1136,29 @@ void inference_task(void* parameter) {
 
     const time_t now_ts = time(nullptr);
 
+    // Classify only once thresholds are trusted; before that the device is
+    // still building its normal-MSE baseline and cannot judge.
+    AnomalySeverity sev     = AnomalySeverity::Normal;
+    bool            anomaly = false;
     if (have_thresholds) {
-      // Severity classification (IQR Tukey fence).
-      AnomalySeverity sev;
       if      (mse > thr[kThrSevere]) sev = AnomalySeverity::Severe;
       else if (mse > thr[kThrAnom])   sev = AnomalySeverity::Anomaly;
       else if (mse > thr[kThrWarn])   sev = AnomalySeverity::Warning;
       else                             sev = AnomalySeverity::Normal;
+      anomaly = (sev >= AnomalySeverity::Anomaly);
+    }
 
-      const bool anomaly = (sev >= AnomalySeverity::Anomaly);
+    // Share the verdict so the 60 s sensor window and the on-demand command
+    // handler both report what the device itself decided.
+    xSemaphoreTake(ctx->sample_mutex, portMAX_DELAY);
+    ctx->latest_severity   = (uint8_t)sev;
+    ctx->latest_mse        = mse;
+    ctx->verdict_ready     = have_thresholds;
+    ctx->baseline_progress = normal_mse_count;
+    ctx->baseline_target   = kNormalMseMinForThreshold;
+    xSemaphoreGive(ctx->sample_mutex);
 
+    if (have_thresholds) {
       ESP_LOGI(TAG, "Infer(%s) v%u mse=%.6f warn=%.4f anom=%.4f [%s]",
                used_q7 ? "Q7" : "F32", (unsigned)version, mse,
                thr[kThrWarn], thr[kThrAnom], severity_str(sev));
@@ -945,28 +1168,40 @@ void inference_task(void* parameter) {
         on_anomaly_event(sev, version, mse,
                          thr[kThrWarn], thr[kThrAnom], thr[kThrSevere], now_ts);
       }
-
-      sd_write_infer(version, mse, true, thr[kThrWarn], thr[kThrAnom], anomaly, now_ts);
-
-      // Publish to TinyAE/infer (non-blocking; drop if queue full).
-      if (s_mqtt_msg_queue != nullptr) {
-        MqttSmallMsg msg;
-        strncpy(msg.topic, tinyae::app::kMqttTopicInfer, sizeof(msg.topic) - 1);
-        msg.topic[sizeof(msg.topic) - 1] = '\0';
-        snprintf(msg.payload, sizeof(msg.payload),
-                 "{\"v\":%u,\"mse\":%.6f,\"severity\":\"%s\",\"anomaly\":%s,"
-                 "\"warn\":%.6f,\"anom\":%.6f,\"severe\":%.6f}",
-                 (unsigned)version, mse, severity_str(sev),
-                 anomaly ? "true" : "false",
-                 thr[kThrWarn], thr[kThrAnom], thr[kThrSevere]);
-        xQueueSend(s_mqtt_msg_queue, &msg, 0);
-      }
     } else {
       ESP_LOGI(TAG, "Infer(%s) v%u mse=%.6f (baseline %u/%u)",
                used_q7 ? "Q7" : "F32", (unsigned)version, mse,
                (unsigned)normal_mse_count, (unsigned)kNormalMseMinForThreshold);
+    }
 
-      sd_write_infer(version, mse, false, 0.0f, 0.0f, false, now_ts);
+    sd_write_infer(version, mse, have_thresholds,
+                   have_thresholds ? thr[kThrWarn] : 0.0f,
+                   have_thresholds ? thr[kThrAnom] : 0.0f,
+                   anomaly, now_ts);
+
+    // Publish every cycle — including during warm-up — so the edge can tell
+    // "still building a baseline" apart from "device went silent".
+    if (s_mqtt_msg_queue != nullptr) {
+      MqttSmallMsg msg;
+      strncpy(msg.topic, tinyae::app::kMqttTopicInfer, sizeof(msg.topic) - 1);
+      msg.topic[sizeof(msg.topic) - 1] = '\0';
+      if (have_thresholds) {
+        snprintf(msg.payload, sizeof(msg.payload),
+                 "{\"state\":\"ready\",\"v\":%u,\"mse\":%.6f,\"severity\":\"%s\","
+                 "\"anomaly\":%s,\"warn\":%.6f,\"anom\":%.6f,\"severe\":%.6f}",
+                 (unsigned)version, mse, severity_str(sev),
+                 anomaly ? "true" : "false",
+                 thr[kThrWarn], thr[kThrAnom], thr[kThrSevere]);
+      } else {
+        snprintf(msg.payload, sizeof(msg.payload),
+                 "{\"state\":\"warming\",\"v\":%u,\"mse\":%.6f,"
+                 "\"severity\":\"warming\",\"anomaly\":false,"
+                 "\"baseline\":%u,\"baseline_target\":%u}",
+                 (unsigned)version, mse,
+                 (unsigned)normal_mse_count,
+                 (unsigned)kNormalMseMinForThreshold);
+      }
+      xQueueSend(s_mqtt_msg_queue, &msg, 0);
     }
   }
 }
@@ -1070,8 +1305,17 @@ void training_task(void* parameter) {
 
     // Save staging_weights (just-trained model) to SD before the pointer swap.
     // staging_weights is only accessed by training_task at this point → no mutex needed.
-    if (train_round == 1 || train_round % kSaveIntervalRounds == 0) {
-      sd_save_model(ctx->staging_weights, ctx->weight_count, train_round);
+    // Round-based saving fires every few seconds once training is hot, which
+    // rewrites ~25 KB to the card far more often than useful. Save the first
+    // round, then at most once per kSaveIntervalMs.
+    {
+      static TickType_t s_last_model_save = 0;
+      const TickType_t now_ticks = xTaskGetTickCount();
+      if (train_round == 1 ||
+          (now_ticks - s_last_model_save) >= pdMS_TO_TICKS(kSaveIntervalMs)) {
+        sd_save_model(ctx->staging_weights, ctx->weight_count, train_round);
+        s_last_model_save = now_ticks;
+      }
     }
 
     // Commit staging -> active: pointer swap keeps mutex critical section to µs.

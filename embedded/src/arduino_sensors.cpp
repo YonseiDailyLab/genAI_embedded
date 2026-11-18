@@ -88,30 +88,45 @@ static void init_sd() {
 static tinyae::app::PipelineConfig boot_menu() {
   tinyae::app::PipelineConfig cfg;
 
-  // Flush any stale bytes that arrived during boot.
-  while (Serial.available()) Serial.read();
-
-  Serial.println();
-  Serial.println("========================================");
-  Serial.println("           TinyAE Boot Menu             ");
-  Serial.println("========================================");
-  Serial.println("  [1] Data Collection Mode");
-  Serial.println("  [2] Training / Inference Mode");
-  Serial.println("----------------------------------------");
-  Serial.println("  No input in 10 s -> [2] Training");
-  Serial.println("========================================");
-  Serial.print("Choice: ");
-
-  // Wait up to 10 s for mode selection.
   char mode_ch = '2';
-  uint32_t t = millis();
-  while (millis() - t < 10000) {
-    if (Serial.available()) {
-      mode_ch = Serial.read();
-      Serial.println(mode_ch);
-      break;
+  for (;;) {
+    // Flush any stale bytes that arrived during boot.
+    while (Serial.available()) Serial.read();
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("           TinyAE Boot Menu             ");
+    Serial.println("========================================");
+    Serial.println("  [1] Data Collection Mode");
+    Serial.println("  [2] Training / Inference Mode");
+    Serial.println("  [3] Recalibrate MQ131 R0 (clean air!)");
+    Serial.println("----------------------------------------");
+    Serial.println("  No input in 10 s -> [2] Training");
+    Serial.println("========================================");
+    Serial.print("Choice: ");
+
+    // Wait up to 10 s for a selection.
+    mode_ch = '2';
+    bool got = false;
+    uint32_t t = millis();
+    while (millis() - t < 10000) {
+      if (Serial.available()) {
+        mode_ch = Serial.read();
+        Serial.println(mode_ch);
+        got = true;
+        break;
+      }
+      delay(50);
     }
-    delay(50);
+
+    // [3]/[r]: recalibrate MQ131 in clean air, then return to the menu.
+    if (got && (mode_ch == '3' || mode_ch == 'r' || mode_ch == 'R')) {
+      Serial.println(">> Recalibrating MQ131 R0 — keep sensor in CLEAN air...");
+      tinyae::data::sensors_recalibrate_mq131();
+      Serial.println(">> Recalibration done.");
+      continue;
+    }
+    break;  // proceed with mode_ch (1, 2, or 10 s timeout default = 2)
   }
 
   if (mode_ch == '1') {
@@ -130,7 +145,7 @@ static tinyae::app::PipelineConfig boot_menu() {
   Serial.print("Choice: ");
 
   char load_ch = 'Y';
-  t = millis();
+  uint32_t t = millis();
   while (millis() - t < 5000) {
     if (Serial.available()) {
       load_ch = Serial.read();
@@ -157,7 +172,9 @@ void start_arduino_sensors() {
   sync_ntp();
   // init_sd() must come AFTER sync_ntp() so that FAT file timestamps
   // reflect real time instead of 1970-01-01.
-  // init_sd();  // TODO: SD card crashes when no card is inserted – re-enable when card is available
+  // Mounts the onboard micro-SD for model persistence (/models/ae_model.bin).
+  // Safe with no card: SD.begin() failure returns early (SD stays disabled).
+  init_sd();
 
   // Show boot menu and start pipeline with selected config.
   const tinyae::app::PipelineConfig cfg = boot_menu();

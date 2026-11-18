@@ -5,6 +5,10 @@ Process 1/2 파이프라인을 백그라운드로 실행하면서,
 외부 요청(Process 2-2)은 FastAPI 엔드포인트로 서빙.
 
 환경변수:
+  LOADER_MODE       : "live"(디바이스 MQTT 실시간 구독) | "file"(라벨 리플레이, 기본)
+  MQTT_HOST         : 브로커 호스트 (기본 192.168.0.23, 디바이스 config.h와 일치)
+  MQTT_PORT         : 브로커 포트 (기본 1883)
+  MQTT_TOPIC_SENSOR : 센서 윈도우 토픽 (기본 TinyAE/sensor)
   ANDLAB_ENDPOINT   : ANDLAB push URL (기본값 http://165.132.192.52:7862/sensor/alert)
   VLM_BASE_URL      : Qwen vLLM OpenAI API URL (기본값 http://127.0.0.1:9000/v1)
   VLM_MODEL         : Qwen 모델 이름 (기본값 Qwen/Qwen2.5-VL-3B-Instruct)
@@ -25,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from detector  import MultimodalAEDetector, MultimodalFuser, SensorDetector, VisionDetector
-from loader    import FileReplayLoader, load_image_b64
+from loader    import FileReplayLoader, LiveLoader, load_image_b64
 from pipeline  import run_pipeline
 from store     import EventStore
 
@@ -38,7 +42,7 @@ log = logging.getLogger("main")
 
 # -- 전역 컴포넌트 --------------------------------------------------------------
 
-loader: FileReplayLoader | None                        = None
+loader: FileReplayLoader | LiveLoader | None           = None
 store:  EventStore | None                              = None
 fuser:  MultimodalAEDetector | MultimodalFuser | None  = None
 
@@ -49,7 +53,14 @@ async def lifespan(app: FastAPI):
 
     log.info("컴포넌트 초기화 중...")
 
-    loader = FileReplayLoader()
+    # LOADER_MODE=live → 디바이스 MQTT 실시간 구독, 그 외 → 라벨 파일 리플레이
+    loader_mode = os.getenv("LOADER_MODE", "file").lower()
+    if loader_mode == "live":
+        loader = LiveLoader()
+        log.info("Loader: LiveLoader (MQTT 실시간 구독)")
+    else:
+        loader = FileReplayLoader()
+        log.info("Loader: FileReplayLoader (라벨 파일 리플레이)")
 
     # SensorDetector: TinyAE + Tukey IQR 임계값 산출 (수십 초 소요)
     log.info("TinyAE 임계값 산출 중 (최초 1회)...")
@@ -78,6 +89,8 @@ async def lifespan(app: FastAPI):
         await task
     except asyncio.CancelledError:
         pass
+    if isinstance(loader, LiveLoader):
+        loader.stop()
     log.info("서버 종료")
 
 
